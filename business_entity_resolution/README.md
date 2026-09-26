@@ -286,6 +286,44 @@ difference (−0.0005). Using the out-of-fold US/India score, France is ~0.943 i
 runs, so the whole loss is in US/India, from the approximate search's lower recall.
 v2 is kept as the submission because of its 3.3× smaller, scalable candidate set.
 
+### v3 development: test-like validation, dense retraining, stage-2 re-scorer (2026-09-26)
+
+**Why.** v2 scored 0.9836 out-of-fold but 0.9775 on the leaderboard. The provided test
+files have 5.75 S2/S3 records per S1 against 4.68 in train, with about the same number of
+true matches per S1 (3.46). So test has about twice as many distractor records per S1
+(2.29 vs 1.22). A model-based check agreed: about 39–40% of US/India test records look like
+distractors, against 26% in train.
+
+**Test-like validation split (`densify.py`).** 18.73% of train S1 entities are removed
+(deterministic hash). Their S2/S3 records stay as distractors, which raises the distractor
+share from 26.0% to 39.9%, and records per S1 from 4.68 to 5.755 (test: 5.754). The
+fraction is derived only from record counts of the provided files. Everything below is
+out-of-fold on this split (US + India, 1.79M S1).
+
+| model | macro F0.5 (test-like split) |
+|---|---|
+| v2 models (leaderboard 0.977538) | 0.98200 |
+| v2 models, decision threshold re-tuned only | 0.98219 |
+| prefilter + matcher retrained on the test-like split (`ER_MODEL_TAG=dense`) | 0.98233 |
+| **+ stage-2 cluster-context re-scorer (`rescore.py`)** | **0.98409** (India 0.98436, US 0.98391) |
+
+Implied France score from the v2 leaderboard, if US/India score as on this split: ~0.952.
+France stays the weakest part, and the country label is never used, so the fixes are
+generic.
+
+**Stage 2** (`rescore.py`) stacks on the matcher's out-of-fold probabilities, cross-fitted
+on the same folds. It adds record-side competition (best / runner-up p, rank, number of
+confident S1s), S1-side cluster state (expected size, confident members overall and per
+source, rank), and **sibling agreement**: embedding cosine and name / address token-set of
+the record against the S1's most confident other members. Top features: p, pmax_r, p1,
+nconf_r, sib_cos_max, psum_s1_others.
+
+**Performance fix.** LightGBM / FAISS were run with all 24 OpenMP threads on a shared
+machine, and one busy core stalled every barrier: 50 trees took 166 s with 24 threads
+against 0.7 s with 20. They now use `OMP_THREADS` = cores − 4 (`ER_OMP_THREADS`).
+Results are unchanged.
+
+
 ---
 
 ## 6. Compliance

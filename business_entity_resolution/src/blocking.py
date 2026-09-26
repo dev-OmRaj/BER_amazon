@@ -34,7 +34,7 @@ import numpy as np
 import polars as pl
 from tqdm import tqdm
 
-from config import (ENCODER_BUCKETS, HNSW_EF_CONSTRUCTION, HNSW_EF_SEARCH, HNSW_M, KNN_K, KNN_MAX_GAP, N_JOBS,
+from config import (ENCODER_BUCKETS, HNSW_EF_CONSTRUCTION, HNSW_EF_SEARCH, HNSW_M, KNN_K, KNN_MAX_GAP, OMP_THREADS,
                     split_dir)
 
 KNN_FILE = "candidates_knn.parquet"
@@ -61,7 +61,7 @@ def knn_hnsw(q: np.ndarray, d: np.ndarray, k: int, desc: str, chunk: int = 200_0
 
     Returns (values, indices, number of distance computations actually performed)."""
     import faiss
-    faiss.omp_set_num_threads(N_JOBS)
+    faiss.omp_set_num_threads(OMP_THREADS)
     d = np.ascontiguousarray(d, dtype=np.float32)
     index = faiss.IndexHNSWFlat(d.shape[1], HNSW_M, faiss.METRIC_INNER_PRODUCT)
     index.hnsw.efConstruction = HNSW_EF_CONSTRUCTION

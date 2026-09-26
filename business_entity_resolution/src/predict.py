@@ -18,7 +18,7 @@ import numpy as np
 import polars as pl
 from tqdm import tqdm
 
-from config import DATA_DIR, OUTPUT_DIR, split_dir
+from config import DATA_DIR, OMP_THREADS, OUTPUT_DIR, split_dir
 from decision import decide
 from io_utils import write_id_lists
 from train_matcher import MATCHER_DIR
@@ -28,6 +28,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--split", default="test")
     ap.add_argument("--out", default=str(OUTPUT_DIR))
+    ap.add_argument("--stage2", action="store_true", help="re-score with the stage-2 cluster-context model")
     args = ap.parse_args()
     t = time.time()
 
@@ -40,7 +41,7 @@ def main():
     ids = recs["entity_id"].to_numpy()
     feats = pl.read_parquet(d / "features.parquet")
     x = feats.select(cols).to_numpy()
-    p = np.mean([m.predict(x, num_threads=0) for m in tqdm(models, desc="score test pairs", unit="model")], axis=0)
+    p = np.mean([m.predict(x, num_threads=OMP_THREADS) for m in tqdm(models, desc="score test pairs", unit="model")], axis=0)
     del x
     pairs = pl.DataFrame({
         "s1_id": ids[feats["s1_idx"].to_numpy()],
@@ -48,6 +49,12 @@ def main():
         "p": p, "cos": feats["cos"].to_numpy(),
     })
     print(f"[predict] scored {pairs.height:,} candidate pairs ({time.time()-t:.0f}s)")
+    if args.stage2:
+        import rescore
+        del feats
+        pairs = rescore.apply(args.split, p)
+        report = json.loads((rescore.STAGE2_DIR / "report.json").read_text())["stage2"]
+        print(f"[predict] stage-2 re-scoring done ({time.time()-t:.0f}s)")
 
     matches = decide(pairs, report["rule"], report["threshold"])
     s1_ids = recs.filter(pl.col("src") == 1)["entity_id"]

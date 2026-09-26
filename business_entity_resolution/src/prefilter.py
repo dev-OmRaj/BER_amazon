@@ -11,8 +11,11 @@ The surviving pairs are the FINAL candidate set: exactly the pairs the matcher s
 written to output/candidate_pairs.tsv.  The stage-1 probability p1 is passed on to the
 matcher as a feature (out-of-fold on train, so no leakage).
 
-    python src/prefilter.py --split train   # cross-fit stage-1 models, choose t1, filter
-    python src/prefilter.py --split test    # apply the saved models / t1
+    python src/prefilter.py --split train          # cross-fit stage-1 models, choose t1, filter
+    python src/prefilter.py --split test           # apply the saved models / t1
+    python src/prefilter.py --split train_dense --reuse
+        # score a train-like split with the SAVED models, out-of-fold (model A scores fold B
+        # and vice versa) and filter with the saved t1 - used to evaluate existing models
 """
 import argparse
 import json
@@ -25,15 +28,15 @@ from rapidfuzz import fuzz
 
 from blocking import KNN_FILE
 from blocking_stats import report
-from config import FOLD_A_BUCKETS, FOLD_B_BUCKETS, PREFILTER_RECALL, SEED, WORK_DIR, split_dir
+from config import FOLD_A_BUCKETS, FOLD_B_BUCKETS, OMP_THREADS, PREFILTER_RECALL, SEED, model_dir, split_dir
 from features import add_labels, embedding_features, number_overlap, str_sims
 from train_matcher import TqdmCallback
 
-PREFILTER_DIR = WORK_DIR / "prefilter"
+PREFILTER_DIR = model_dir("prefilter")
 PARAMS = dict(
     objective="binary", learning_rate=0.1, num_leaves=63, min_data_in_leaf=500,
     feature_fraction=0.9, bagging_fraction=0.8, bagging_freq=1, max_bin=127,
-    verbose=-1, seed=SEED, num_threads=0,
+    verbose=-1, seed=SEED, num_threads=OMP_THREADS,
 )
 
 
@@ -89,22 +92,39 @@ def write_survivors(split, cand, p1, t1):
     report(split, out, "final")
 
 
-def train():
+def cross_scores(ma, mb, df, cols):
+    """Out-of-fold stage-1 scores: model A scores fold B, B scores A, encoder buckets get the mean."""
+    x = df.select(cols).to_numpy()
+    bucket = df["bucket"].to_numpy()
+    pa, pb = ma.predict(x, num_threads=OMP_THREADS), mb.predict(x, num_threads=OMP_THREADS)
+    is_a = np.isin(bucket, FOLD_A_BUCKETS)
+    is_b = np.isin(bucket, FOLD_B_BUCKETS)
+    return np.where(is_b, pa, np.where(is_a, pb, 0.5 * (pa + pb))), is_a | is_b
+
+
+def reuse(split):
     t = time.time()
-    cand, df = cheap_features("train")
+    info = json.loads((PREFILTER_DIR / "prefilter.json").read_text())
+    ma, mb = (lgb.Booster(model_file=str(PREFILTER_DIR / f"model_{k}.txt")) for k in ("A", "B"))
+    cand, df = cheap_features(split)
+    p1, ev = cross_scores(ma, mb, df, ma.feature_name())
+    y = df["y"].to_numpy()
+    print(f"[prefilter] {split} (saved models, out-of-fold): true kNN pairs kept "
+          f"{(p1[ev & (y == 1)] >= info['t1']).mean():.5f} at saved t1={info['t1']:.5f}")
+    write_survivors(split, cand, p1, info["t1"])
+    print(f"[prefilter] done ({time.time()-t:.0f}s)")
+
+
+def train(split="train"):
+    t = time.time()
+    cand, df = cheap_features(split)
     cols = feature_cols(df)
-    print(f"[prefilter] train: {df.height:,} kNN pairs, {len(cols)} cheap features ({time.time()-t:.0f}s)")
+    print(f"[prefilter] {split}: {df.height:,} kNN pairs, {len(cols)} cheap features ({time.time()-t:.0f}s)")
     in_a, in_b = pl.col("bucket").is_in(list(FOLD_A_BUCKETS)), pl.col("bucket").is_in(list(FOLD_B_BUCKETS))
     ma = fit(df.filter(in_a), cols, "stage-1 model A")
     mb = fit(df.filter(in_b), cols, "stage-1 model B")
-    x = df.select(cols).to_numpy()
-    bucket = df["bucket"].to_numpy()
-    pa, pb = ma.predict(x), mb.predict(x)
-    is_a = np.isin(bucket, FOLD_A_BUCKETS)
-    is_b = np.isin(bucket, FOLD_B_BUCKETS)
-    p1 = np.where(is_b, pa, np.where(is_a, pb, 0.5 * (pa + pb)))  # out-of-fold; encoder buckets: average
+    p1, ev = cross_scores(ma, mb, df, cols)
     y = df["y"].to_numpy()
-    ev = (is_a | is_b)
     t1 = float(np.quantile(p1[ev & (y == 1)], 1 - PREFILTER_RECALL))
     PREFILTER_DIR.mkdir(parents=True, exist_ok=True)
     ma.save_model(str(PREFILTER_DIR / "model_A.txt"))
@@ -114,7 +134,7 @@ def train():
             "true_pairs_kept_oof": float((p1[ev & (y == 1)] >= t1).mean())}
     (PREFILTER_DIR / "prefilter.json").write_text(json.dumps(info, indent=2))
     print(f"[prefilter] {info}")
-    write_survivors("train", cand, p1, t1)
+    write_survivors(split, cand, p1, t1)
     print(f"[prefilter] done ({time.time()-t:.0f}s)")
 
 
@@ -124,7 +144,7 @@ def apply(split):
     models = [lgb.Booster(model_file=str(PREFILTER_DIR / f"model_{k}.txt")) for k in ("A", "B")]
     cand, df = cheap_features(split)
     x = df.select(models[0].feature_name()).to_numpy()
-    p1 = np.mean([m.predict(x) for m in models], axis=0)
+    p1 = np.mean([m.predict(x, num_threads=OMP_THREADS) for m in models], axis=0)
     write_survivors(split, cand, p1, info["t1"])
     print(f"[prefilter] done ({time.time()-t:.0f}s)")
 
@@ -132,8 +152,14 @@ def apply(split):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--split", required=True)
+    ap.add_argument("--reuse", action="store_true", help="train-like split: evaluate the saved models")
     args = ap.parse_args()
-    train() if args.split == "train" else apply(args.split)
+    if not args.split.startswith("train"):
+        apply(args.split)
+    elif args.reuse:
+        reuse(args.split)
+    else:
+        train(args.split)
 
 
 if __name__ == "__main__":

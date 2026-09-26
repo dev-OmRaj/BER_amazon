@@ -21,6 +21,10 @@ OUTPUT_DIR = Path(os.environ.get("ER_OUTPUT_DIR", PROJECT_DIR / "output"))
 
 SEED = 42
 N_JOBS = int(os.environ.get("ER_N_JOBS", os.cpu_count() or 8))
+# OpenMP libraries (LightGBM, FAISS) stall badly when asked for every core of a shared
+# machine: one busy core delays all threads at each barrier (measured: 24 threads 166 s vs
+# 20 threads 0.7 s for the same 50 trees).  Leave a few cores free.
+OMP_THREADS = int(os.environ.get("ER_OMP_THREADS", max(1, N_JOBS - 4)))
 
 # ---------------------------------------------------------------- folds (train only)
 # Each Source-1 cluster (the S1 record + all its true S2/S3 matches) is hashed into
@@ -48,6 +52,24 @@ KNN_MAX_GAP = float(os.environ.get("ER_KNN_MAX_GAP", 0.25))
 HNSW_M = int(os.environ.get("ER_HNSW_M", 32))
 HNSW_EF_CONSTRUCTION = int(os.environ.get("ER_HNSW_EF_CONSTRUCTION", 200))
 HNSW_EF_SEARCH = int(os.environ.get("ER_HNSW_EF_SEARCH", 128))
+
+# ---------------------------------------------------------------- model versions
+# ER_MODEL_TAG selects a separate set of prefilter / matcher models, e.g. "dense" ->
+# work/prefilter_dense/, work/matcher_dense/.  Empty = the v2 models (work/prefilter/, work/matcher/).
+MODEL_TAG = os.environ.get("ER_MODEL_TAG", "")
+
+
+def model_dir(name: str) -> Path:
+    return WORK_DIR / (f"{name}_{MODEL_TAG}" if MODEL_TAG else name)
+
+
+# ---------------------------------------------------------------- test-like training split
+# The test set has more S2/S3 records per S1 than train (5.75 vs 4.68) while the number of
+# true matches per S1 is the same by construction of the data, i.e. more distractors.
+# densify.py removes this fraction of train S1 entities (their S2/S3 records become
+# distractors) so that train has the same distractor density as test.  None = derive it
+# from the record counts of the provided train / test files.
+DENSIFY_FRAC = float(os.environ["ER_DENSIFY_FRAC"]) if os.environ.get("ER_DENSIFY_FRAC") else None
 
 # ---------------------------------------------------------------- stage-1 prefilter
 # the cheap stage-1 model keeps the smallest candidate set that still contains this

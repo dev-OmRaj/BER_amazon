@@ -6,7 +6,10 @@ decision rule/threshold is then chosen by maximising the challenge metric (macro
 over all S1 entities of folds A+B, singletons included).  At test time the two models
 are averaged.
 
-    python src/train_matcher.py [--max-rows 12000000] [--transfer]
+    python src/train_matcher.py [--split train] [--max-rows 12000000] [--transfer]
+    python src/train_matcher.py --split train_dense --reuse
+        # score a train-like split with the SAVED models out-of-fold and report the metric
+        # with the saved rule / threshold (plus the best re-tuned one, for information)
 
 --transfer additionally trains on US only and evaluates on India (and vice versa):
 a proxy for how well the model generalises to an unseen country (France).
@@ -20,16 +23,15 @@ import numpy as np
 import polars as pl
 from tqdm import tqdm
 
-from config import ENCODER_BUCKETS, FOLD_A_BUCKETS, FOLD_B_BUCKETS, SEED, WORK_DIR, split_dir
+from config import ENCODER_BUCKETS, FOLD_A_BUCKETS, FOLD_B_BUCKETS, OMP_THREADS, SEED, model_dir, split_dir
 from decision import decide, macro_f05
 from features import feature_columns
-from io_utils import read_ground_truth
 
-MATCHER_DIR = WORK_DIR / "matcher"
+MATCHER_DIR = model_dir("matcher")
 PARAMS = dict(
     objective="binary", learning_rate=0.05, num_leaves=127, min_data_in_leaf=200,
     feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1, lambda_l2=1.0,
-    max_bin=255, verbose=-1, seed=SEED, num_threads=0,
+    max_bin=255, verbose=-1, seed=SEED, num_threads=OMP_THREADS,
 )
 
 
@@ -65,7 +67,7 @@ def fit(df: pl.DataFrame, cols, max_rows, rounds, desc="lightgbm"):
 
 def predict(models, df, cols):
     x = df.select(cols).to_numpy()
-    return np.mean([m.predict(x, num_iteration=m.best_iteration) for m in models], axis=0)
+    return np.mean([m.predict(x, num_iteration=m.best_iteration, num_threads=OMP_THREADS) for m in models], axis=0)
 
 
 def search_rule(pairs, truth, s1_ids, label=""):
@@ -86,13 +88,15 @@ def main():
     ap.add_argument("--max-rows", type=int, default=12_000_000, help="training rows per fold model")
     ap.add_argument("--rounds", type=int, default=5000)
     ap.add_argument("--transfer", action="store_true")
+    ap.add_argument("--split", default="train")
+    ap.add_argument("--reuse", action="store_true", help="evaluate the saved models instead of training")
     args = ap.parse_args()
     t0 = time.time()
 
-    d = split_dir("train")
+    d = split_dir(args.split)
     feats = pl.read_parquet(d / "features.parquet")
     cols = feature_columns(feats)
-    recs = pl.read_parquet(d / "records.parquet", columns=["entity_id", "src", "country", "bucket"]) \
+    recs = pl.read_parquet(d / "records.parquet", columns=["entity_id", "src", "country", "bucket", "true_s1"]) \
         .with_row_index("idx")
     ids = recs["entity_id"].to_numpy()
     feats = feats.with_columns(
@@ -106,10 +110,14 @@ def main():
     in_b = pl.col("bucket").is_in(list(FOLD_B_BUCKETS))
     fa, fb = feats.filter(in_a), feats.filter(in_b)
     enc = feats.filter(pl.col("bucket").is_in(list(ENCODER_BUCKETS)))
-    print("[matcher] model A (fold A -> scores fold B)")
-    ma = fit(fa, cols, args.max_rows, args.rounds, desc="model A")
-    print("[matcher] model B (fold B -> scores fold A)")
-    mb = fit(fb, cols, args.max_rows, args.rounds, desc="model B")
+    if args.reuse:
+        ma, mb = (lgb.Booster(model_file=str(MATCHER_DIR / f"model_{k}.txt")) for k in ("A", "B"))
+        print(f"[matcher] reusing saved models from {MATCHER_DIR}")
+    else:
+        print("[matcher] model A (fold A -> scores fold B)")
+        ma = fit(fa, cols, args.max_rows, args.rounds, desc="model A")
+        print("[matcher] model B (fold B -> scores fold A)")
+        mb = fit(fb, cols, args.max_rows, args.rounds, desc="model B")
     oof = pl.concat([
         fb.with_columns(pl.Series("p", predict([ma], fb, cols))),
         fa.with_columns(pl.Series("p", predict([mb], fa, cols))),
@@ -117,13 +125,24 @@ def main():
     ]).select("s1_id", "r_id", "p", "cos", "y", "country")
     print(f"[matcher] out-of-fold scoring done ({time.time()-t0:.0f}s)")
     MATCHER_DIR.mkdir(parents=True, exist_ok=True)
-    oof.write_parquet(MATCHER_DIR / "oof.parquet")  # for error analysis
+    oof.write_parquet(MATCHER_DIR / f"oof_{args.split}.parquet")  # for error analysis
 
-    # evaluation set: every S1 entity of folds A+B (singletons included)
+    # evaluation set: every S1 entity of folds A+B (singletons included); truth from records
     s1 = recs.filter((pl.col("src") == 1) & (in_a | in_b))
-    truth = read_ground_truth().join(s1.select(pl.col("entity_id").alias("s1_id")), on="s1_id")
-    rule, t, f = search_rule(oof, truth, s1["entity_id"], "overall")
-    report = {"rule": rule, "threshold": t, "oof_macro_f05": f, "per_country": {}}
+    truth = recs.filter(pl.col("true_s1").is_not_null()).select(
+        pl.col("true_s1").alias("s1_id"), pl.col("entity_id").alias("r_id")) \
+        .join(s1.select(pl.col("entity_id").alias("s1_id")), on="s1_id")
+    if args.reuse:
+        saved = json.loads((MATCHER_DIR / "report.json").read_text())
+        rule, t = saved["rule"], saved["threshold"]
+        f = macro_f05(decide(oof, rule, t), truth, s1["entity_id"])
+        print(f"[matcher] {args.split}: saved models + saved rule={rule} t={t:.2f}  macro F0.5={f:.5f}")
+        best = search_rule(oof, truth, s1["entity_id"], "re-tuned (information only)")
+        report = {"split": args.split, "rule": rule, "threshold": t, "macro_f05_saved_rule": f,
+                  "best_retuned": {"rule": best[0], "threshold": best[1], "macro_f05": best[2]}, "per_country": {}}
+    else:
+        rule, t, f = search_rule(oof, truth, s1["entity_id"], "overall")
+        report = {"split": args.split, "rule": rule, "threshold": t, "oof_macro_f05": f, "per_country": {}}
     for country in sorted(s1["country"].unique().to_list()):
         s1c = s1.filter(pl.col("country") == country)["entity_id"]
         pc = oof.filter(pl.col("country") == country)
@@ -134,6 +153,11 @@ def main():
     perfect = oof.filter(pl.col("y") == 1).select("s1_id", "r_id")
     report["blocking_ceiling_f05"] = macro_f05(perfect, truth, s1["entity_id"])
     print(f"[matcher] ceiling with perfect matcher on these candidates: {report['blocking_ceiling_f05']:.5f}")
+
+    if args.reuse:
+        (MATCHER_DIR / f"eval_{args.split}.json").write_text(json.dumps(report, indent=2))
+        print(f"[matcher] wrote {MATCHER_DIR / f'eval_{args.split}.json'} ({time.time()-t0:.0f}s)")
+        return
 
     if args.transfer:
         report["transfer"] = {}
